@@ -255,12 +255,12 @@ async def chat_completion(
 
         print(f"[SERVER DEBUG] Request received:")
         print(f"  Request ID: {raw_body['request_id']}")
-        print(f"  Model: {raw_body['model']}")
+        print(f"  Model: {raw_body.get('model', 'gpt-4o-mini')}")
         print(f"  Timestamp: {raw_body['timestamp']}")
         print(f"  Nonce: {raw_body['nonce']}")
         print(f"  Messages count: {len(raw_body['messages'])}")
-        print(f"  Temperature: {raw_body['temperature']}")
-        print(f"  Max tokens: {raw_body.get('max_tokens')}")
+        print(f"  Temperature: {raw_body.get('temperature', 0.7)}")
+        print(f"  Max tokens: {raw_body.get('max_tokens', 'None')}")
 
         # Step 1: Verify nonce is unique (prevent replay attacks)
         if not check_and_store_nonce(raw_body['nonce']):
@@ -317,7 +317,7 @@ async def chat_completion(
 
             # Track usage
             tokens_used = result.get("usage", {}).get("total_tokens", 0)
-            track_usage(headers["fingerprint"], raw_body.get("model", "gpt-4o-mini"), tokens_used)
+            track_usage(headers["fingerprint"], openai_request.model, tokens_used)
 
             return result
 
