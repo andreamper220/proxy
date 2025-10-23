@@ -270,8 +270,8 @@ async def chat_completion(
             raise HTTPException(status_code=400, detail="Nonce already used (replay attack detected)")
 
         # Step 2: Calculate body hash (exact same as client)
-        # Client sends: {messages, timestamp, nonce, request_id}
-        # Server should hash the exact same structure
+        # Client creates: {messages, timestamp, nonce, request_id}
+        # Server should create the exact same structure
         body_dict = {
             "messages": raw_body["messages"],
             "timestamp": raw_body["timestamp"],
@@ -279,8 +279,9 @@ async def chat_completion(
             "request_id": raw_body["request_id"]
         }
 
-        print(f"[SERVER DEBUG] Body dict for hash: {body_dict}")
-        print(f"[SERVER DEBUG] Body dict keys: {list(body_dict.keys())}")
+        # Debug: show what we're about to hash
+        print(f"[SERVER DEBUG] About to hash: {len(str(body_dict))} chars")
+        print(f"[SERVER DEBUG] Body dict sample: {str(body_dict)[:200]}...")
 
         body_hash = generate_body_hash(body_dict)
 
