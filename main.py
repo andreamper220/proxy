@@ -127,12 +127,14 @@ def verify_request_signature(
 
 def generate_body_hash(body_dict: Dict[str, Any]) -> str:
     """Generate hash of request body for integrity verification"""
-    body_str = json.dumps(body_dict, sort_keys=True, separators=(',', ':'))
-    body_hash = hashlib.sha256(body_str.encode('utf-8')).hexdigest()
+    # Hash simple concatenated string instead of JSON
+    # Format: messages|timestamp|nonce|request_id
+    messages_str = json.dumps(body_dict["messages"])
+    hash_string = f"{messages_str}|{body_dict['timestamp']}|{body_dict['nonce']}|{body_dict['request_id']}"
 
-    keys = sorted(body_dict.keys())
-    print(f"[SERVER] Body hash: keys=[{','.join(keys)}] len={len(body_str)} hash={body_hash[:16]}...")
-    print(f"[SERVER DEBUG] JSON string sample: {body_str[:200]}...")
+    body_hash = hashlib.sha256(hash_string.encode('utf-8')).hexdigest()
+
+    print(f"[SERVER] Body hash: len={len(hash_string)} hash={body_hash[:16]}...")
 
     return body_hash
 
@@ -270,8 +272,11 @@ async def chat_completion(
             raise HTTPException(status_code=400, detail="Nonce already used (replay attack detected)")
 
         # Step 2: Calculate body hash (exact same as client)
-        # Client creates: {messages, timestamp, nonce, request_id}
-        # Server should create the exact same structure
+        # The client creates: {messages, timestamp, nonce, request_id}
+        # The client hashes: 12169 characters
+        # The server should hash the exact same data
+
+        # Create the exact same structure as client
         body_dict = {
             "messages": raw_body["messages"],
             "timestamp": raw_body["timestamp"],
