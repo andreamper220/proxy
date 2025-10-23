@@ -263,9 +263,9 @@ async def chat_completion(
         if not check_and_store_nonce(openai_request.nonce):
             raise HTTPException(status_code=400, detail="Nonce already used (replay attack detected)")
 
-        # Step 2: Calculate body hash
+        # Step 2: Calculate body hash (same fields as client)
         body_dict = {
-            "messages": [msg.dict() for msg in openai_request.messages],
+            "messages": [{"role": msg.role, "content": msg.content} for msg in openai_request.messages],
             "timestamp": openai_request.timestamp,
             "nonce": openai_request.nonce,
             "request_id": openai_request.request_id
