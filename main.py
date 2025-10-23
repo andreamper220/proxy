@@ -280,6 +280,7 @@ async def chat_completion(
         
         # Step 4: All validations passed - make OpenAI API call
         async with httpx.AsyncClient(timeout=60.0) as client:
+            print("here: " + OPENAI_API_KEY)
             openai_response = await client.post(
                 "https://api.openai.com/v1/chat/completions",
                 json={
