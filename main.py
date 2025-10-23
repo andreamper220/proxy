@@ -268,8 +268,11 @@ async def chat_completion(
         print(f"  Max tokens: {raw_body.get('max_tokens', 'None')}")
 
         # Step 1: Verify nonce is unique (prevent replay attacks)
+        print(f"[SERVER] Nonce check: {raw_body['nonce']}")
         if not check_and_store_nonce(raw_body['nonce']):
+            print(f"[SERVER] Nonce already used: {raw_body['nonce']}")
             raise HTTPException(status_code=400, detail="Nonce already used (replay attack detected)")
+        print(f"[SERVER] Nonce valid: {raw_body['nonce']}")
 
         # Step 2: Calculate body hash (exact same as client)
         # The client creates: {messages, timestamp, nonce, request_id}
@@ -305,6 +308,8 @@ async def chat_completion(
 
         if not signature_valid:
             raise HTTPException(status_code=401, detail="Invalid request signature")
+
+        print(f"[SERVER] All validations passed! Making OpenAI API call...")
 
         # Step 4: All validations passed - make OpenAI API call
         async with httpx.AsyncClient(timeout=60.0) as client:
