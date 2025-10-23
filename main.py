@@ -243,7 +243,6 @@ async def health_check():
 @app.post("/api/openai/chat")
 async def chat_completion(
     request: Request,
-    openai_request: OpenAIRequest,
     headers: Dict[str, str] = Depends(verify_extension_headers)
 ):
     """
@@ -251,24 +250,28 @@ async def chat_completion(
     Validates all security parameters before proxying to OpenAI
     """
     try:
+        # Get raw request body
+        raw_body = await request.json()
+
         print(f"[SERVER DEBUG] Request received:")
-        print(f"  Request ID: {openai_request.request_id}")
-        print(f"  Model: {openai_request.model}")
-        print(f"  Timestamp: {openai_request.timestamp}")
-        print(f"  Nonce: {openai_request.nonce}")
-        print(f"  Messages count: {len(openai_request.messages)}")
-        print(f"  Temperature: {openai_request.temperature}")
-        print(f"  Max tokens: {openai_request.max_tokens}")
+        print(f"  Request ID: {raw_body['request_id']}")
+        print(f"  Model: {raw_body['model']}")
+        print(f"  Timestamp: {raw_body['timestamp']}")
+        print(f"  Nonce: {raw_body['nonce']}")
+        print(f"  Messages count: {len(raw_body['messages'])}")
+        print(f"  Temperature: {raw_body['temperature']}")
+        print(f"  Max tokens: {raw_body.get('max_tokens')}")
+
         # Step 1: Verify nonce is unique (prevent replay attacks)
-        if not check_and_store_nonce(openai_request.nonce):
+        if not check_and_store_nonce(raw_body['nonce']):
             raise HTTPException(status_code=400, detail="Nonce already used (replay attack detected)")
 
         # Step 2: Calculate body hash (same fields as client)
         body_dict = {
-            "messages": [{"role": msg.role, "content": msg.content} for msg in openai_request.messages],
-            "timestamp": openai_request.timestamp,
-            "nonce": openai_request.nonce,
-            "request_id": openai_request.request_id
+            "messages": raw_body["messages"],
+            "timestamp": raw_body["timestamp"],
+            "nonce": raw_body["nonce"],
+            "request_id": raw_body["request_id"]
         }
         body_hash = generate_body_hash(body_dict)
 
@@ -277,9 +280,9 @@ async def chat_completion(
 
         signature_valid = verify_request_signature(
             headers["signature"],
-            openai_request.timestamp,
-            openai_request.nonce,
-            openai_request.request_id,
+            raw_body["timestamp"],
+            raw_body["nonce"],
+            raw_body["request_id"],
             body_hash
         )
 
@@ -293,10 +296,10 @@ async def chat_completion(
             openai_response = await client.post(
                 "https://api.openai.com/v1/chat/completions",
                 json={
-                    "model": openai_request.model,
-                    "messages": [msg.dict() for msg in openai_request.messages],
-                    "temperature": openai_request.temperature,
-                    **({"max_tokens": openai_request.max_tokens} if openai_request.max_tokens else {})
+                    "model": raw_body["model"],
+                    "messages": raw_body["messages"],
+                    "temperature": raw_body["temperature"],
+                    **({"max_tokens": raw_body["max_tokens"]} if raw_body.get("max_tokens") else {})
                 },
                 headers={
                     "Authorization": f"Bearer {OPENAI_API_KEY}",
