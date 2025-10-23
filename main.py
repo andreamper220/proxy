@@ -253,6 +253,8 @@ async def chat_completion(
         # Get raw request body
         raw_body = await request.json()
 
+        print(f"[SERVER DEBUG] Raw body keys: {list(raw_body.keys())}")
+        print(f"[SERVER DEBUG] Raw body length: {len(str(raw_body))}")
         print(f"[SERVER DEBUG] Request received:")
         print(f"  Request ID: {raw_body['request_id']}")
         print(f"  Model: {raw_body.get('model', 'gpt-4o-mini')}")
