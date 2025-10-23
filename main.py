@@ -132,6 +132,7 @@ def generate_body_hash(body_dict: Dict[str, Any]) -> str:
 
     keys = sorted(body_dict.keys())
     print(f"[SERVER] Body hash: keys=[{','.join(keys)}] len={len(body_str)} hash={body_hash[:16]}...")
+    print(f"[SERVER DEBUG] JSON string sample: {body_str[:200]}...")
 
     return body_hash
 
@@ -268,13 +269,19 @@ async def chat_completion(
         if not check_and_store_nonce(raw_body['nonce']):
             raise HTTPException(status_code=400, detail="Nonce already used (replay attack detected)")
 
-        # Step 2: Calculate body hash (same fields as client)
+        # Step 2: Calculate body hash (exact same as client)
+        # Client sends: {messages, timestamp, nonce, request_id}
+        # Server should hash the exact same structure
         body_dict = {
             "messages": raw_body["messages"],
             "timestamp": raw_body["timestamp"],
             "nonce": raw_body["nonce"],
             "request_id": raw_body["request_id"]
         }
+
+        print(f"[SERVER DEBUG] Body dict for hash: {body_dict}")
+        print(f"[SERVER DEBUG] Body dict keys: {list(body_dict.keys())}")
+
         body_hash = generate_body_hash(body_dict)
 
         # Step 3: Verify request signature
@@ -319,7 +326,7 @@ async def chat_completion(
 
             # Track usage
             tokens_used = result.get("usage", {}).get("total_tokens", 0)
-            track_usage(headers["fingerprint"], openai_request.model, tokens_used)
+            track_usage(headers["fingerprint"], raw_body.get("model", "gpt-4o-mini"), tokens_used)
 
             return result
 
