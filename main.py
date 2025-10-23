@@ -127,10 +127,10 @@ def verify_request_signature(
 
 def generate_body_hash(body_dict: Dict[str, Any]) -> str:
     """Generate hash of request body for integrity verification"""
-    # Hash simple concatenated string instead of JSON
-    # Format: messages|timestamp|nonce|request_id
-    messages_str = json.dumps(body_dict["messages"])
-    hash_string = f"{messages_str}|{body_dict['timestamp']}|{body_dict['nonce']}|{body_dict['request_id']}"
+    # Hash even simpler - just the individual values
+    # Format: timestamp|nonce|request_id|message_count
+    message_count = len(body_dict["messages"])
+    hash_string = f"{body_dict['timestamp']}|{body_dict['nonce']}|{body_dict['request_id']}|{message_count}"
 
     body_hash = hashlib.sha256(hash_string.encode('utf-8')).hexdigest()
 
