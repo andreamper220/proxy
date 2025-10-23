@@ -262,6 +262,27 @@ async def health_check():
     }
 
 
+@app.post("/api/debug/raw")
+async def debug_raw_request(request: Request):
+    """Debug endpoint to see raw request body"""
+    try:
+        body = await request.body()
+        print(f"[DEBUG] Raw request body: {body}")
+        print(f"[DEBUG] Content-Type: {request.headers.get('content-type')}")
+        print(f"[DEBUG] Headers: {dict(request.headers)}")
+
+        try:
+            json_body = await request.json()
+            print(f"[DEBUG] Parsed JSON: {json_body}")
+        except Exception as e:
+            print(f"[DEBUG] JSON parse error: {e}")
+
+        return {"status": "debug_complete", "body_length": len(body)}
+    except Exception as e:
+        print(f"[DEBUG] Error: {e}")
+        return {"error": str(e)}
+
+
 @app.post("/api/openai/chat")
 async def chat_completion(
     request: Request,
@@ -273,6 +294,14 @@ async def chat_completion(
     Validates all security parameters before proxying to OpenAI
     """
     try:
+        print(f"[SERVER DEBUG] Request received:")
+        print(f"  Request ID: {openai_request.request_id}")
+        print(f"  Model: {openai_request.model}")
+        print(f"  Timestamp: {openai_request.timestamp}")
+        print(f"  Nonce: {openai_request.nonce}")
+        print(f"  Messages count: {len(openai_request.messages)}")
+        print(f"  Temperature: {openai_request.temperature}")
+        print(f"  Max tokens: {openai_request.max_tokens}")
         # Step 1: Verify nonce is unique (prevent replay attacks)
         if not check_and_store_nonce(openai_request.nonce):
             raise HTTPException(status_code=400, detail="Nonce already used (replay attack detected)")
