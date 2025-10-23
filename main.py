@@ -82,7 +82,8 @@ class OpenAIRequest(BaseModel):
             'gpt-3.5-turbo-16k',
             'gpt-4',
             'gpt-4-turbo-preview',
-            'gpt-4-turbo'
+            'gpt-4-turbo',
+            'gpt-4o-mini',
         ]
         if v not in allowed_models:
             raise ValueError(f'Model {v} not allowed')
