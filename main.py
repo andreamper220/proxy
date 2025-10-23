@@ -296,9 +296,9 @@ async def chat_completion(
             openai_response = await client.post(
                 "https://api.openai.com/v1/chat/completions",
                 json={
-                    "model": raw_body["model"],
+                    "model": raw_body.get("model", "gpt-4o-mini"),
                     "messages": raw_body["messages"],
-                    "temperature": raw_body["temperature"],
+                    "temperature": raw_body.get("temperature", 0.7),
                     **({"max_tokens": raw_body["max_tokens"]} if raw_body.get("max_tokens") else {})
                 },
                 headers={
