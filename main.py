@@ -82,8 +82,7 @@ class OpenAIRequest(BaseModel):
             'gpt-3.5-turbo-16k',
             'gpt-4',
             'gpt-4-turbo-preview',
-            'gpt-4-turbo',
-            'gpt-4o-mini',
+            'gpt-4-turbo'
         ]
         if v not in allowed_models:
             raise ValueError(f'Model {v} not allowed')
@@ -98,30 +97,15 @@ def generate_request_signature(
     body_hash: str,
     secret: str
 ) -> str:
-    """
-    Generate HMAC signature for request validation
-    Format: HMAC-SHA256(timestamp|nonce|request_id|body_hash, secret)
-    """
+    """Generate HMAC signature for request validation"""
     message = f"{timestamp}|{nonce}|{request_id}|{body_hash}"
-
-    print(f"[SERVER DEBUG] Signature generation:")
-    print(f"  Timestamp: {timestamp}")
-    print(f"  Nonce: {nonce}")
-    print(f"  Request ID: {request_id}")
-    print(f"  Body Hash: {body_hash}")
-    print(f"  Full message: {message}")
-    print(f"  Message length: {len(message)}")
-    print(f"  Secret key length: {len(secret)}")
-    print(f"  Secret key (first 10): {secret[:10]}")
-
     signature = hmac.new(
         secret.encode('utf-8'),
         message.encode('utf-8'),
         hashlib.sha256
     ).hexdigest()
 
-    print(f"  Generated signature: {signature}")
-    print(f"  Signature length: {len(signature)}")
+    print(f"[SERVER] Signature: msg_len={len(message)} sig={signature[:16]}...")
 
     return signature
 
@@ -141,20 +125,12 @@ def verify_request_signature(
 
 
 def generate_body_hash(body_dict: Dict[str, Any]) -> str:
-    """
-    Generate hash of request body for integrity verification
-    Uses sorted JSON to ensure consistent hashing
-    """
-    # Create deterministic JSON string
+    """Generate hash of request body for integrity verification"""
     body_str = json.dumps(body_dict, sort_keys=True, separators=(',', ':'))
-
-    print(f"[SERVER DEBUG] Body hash calculation:")
-    print(f"  Input dict: {body_dict}")
-    print(f"  JSON string: {body_str}")
-    print(f"  JSON length: {len(body_str)}")
-
     body_hash = hashlib.sha256(body_str.encode('utf-8')).hexdigest()
-    print(f"  Body hash: {body_hash}")
+
+    keys = sorted(body_dict.keys())
+    print(f"[SERVER] Body hash: keys=[{','.join(keys)}] len={len(body_str)} hash={body_hash[:16]}...")
 
     return body_hash
 
@@ -263,27 +239,6 @@ async def health_check():
     }
 
 
-@app.post("/api/debug/raw")
-async def debug_raw_request(request: Request):
-    """Debug endpoint to see raw request body"""
-    try:
-        body = await request.body()
-        print(f"[DEBUG] Raw request body: {body}")
-        print(f"[DEBUG] Content-Type: {request.headers.get('content-type')}")
-        print(f"[DEBUG] Headers: {dict(request.headers)}")
-
-        try:
-            json_body = await request.json()
-            print(f"[DEBUG] Parsed JSON: {json_body}")
-        except Exception as e:
-            print(f"[DEBUG] JSON parse error: {e}")
-
-        return {"status": "debug_complete", "body_length": len(body)}
-    except Exception as e:
-        print(f"[DEBUG] Error: {e}")
-        return {"error": str(e)}
-
-
 @app.post("/api/openai/chat")
 async def chat_completion(
     request: Request,
@@ -317,9 +272,7 @@ async def chat_completion(
         body_hash = generate_body_hash(body_dict)
 
         # Step 3: Verify request signature
-        print(f"[SERVER DEBUG] Signature verification:")
-        print(f"  Received signature: {headers['signature']}")
-        print(f"  Received signature length: {len(headers['signature'])}")
+        print(f"[SERVER] Verification: recv_sig={headers['signature'][:16]}...")
 
         signature_valid = verify_request_signature(
             headers["signature"],
@@ -329,7 +282,7 @@ async def chat_completion(
             body_hash
         )
 
-        print(f"  Signature valid: {signature_valid}")
+        print(f"[SERVER] Result: valid={signature_valid}")
 
         if not signature_valid:
             raise HTTPException(status_code=401, detail="Invalid request signature")
