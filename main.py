@@ -317,7 +317,7 @@ async def chat_completion(
 
             # Track usage
             tokens_used = result.get("usage", {}).get("total_tokens", 0)
-            track_usage(headers["fingerprint"], openai_request.model, tokens_used)
+            track_usage(headers["fingerprint"], raw_body.get("model", "gpt-4o-mini"), tokens_used)
 
             return result
 
