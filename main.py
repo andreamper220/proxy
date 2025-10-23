@@ -137,8 +137,6 @@ def generate_body_hash(body_dict: Dict[str, Any]) -> str:
 
     body_hash = hashlib.sha256(hash_string.encode('utf-8')).hexdigest()
 
-    print(f"[SERVER] Body hash: len={len(hash_string)} hash={body_hash[:16]}...")
-
     return body_hash
 
 
@@ -259,30 +257,11 @@ async def chat_completion(
         # Get raw request body
         raw_body = await request.json()
 
-        print(f"[SERVER DEBUG] Raw body keys: {list(raw_body.keys())}")
-        print(f"[SERVER DEBUG] Raw body length: {len(str(raw_body))}")
-        print(f"[SERVER DEBUG] Request received:")
-        print(f"  Request ID: {raw_body['request_id']}")
-        print(f"  Model: {raw_body.get('model', 'gpt-4o-mini')}")
-        print(f"  Timestamp: {raw_body['timestamp']}")
-        print(f"  Nonce: {raw_body['nonce']}")
-        print(f"  Messages count: {len(raw_body['messages'])}")
-        print(f"  Temperature: {raw_body.get('temperature', 0.7)}")
-        print(f"  Max tokens: {raw_body.get('max_tokens', 'None')}")
-
         # Step 1: Verify nonce is unique (prevent replay attacks)
-        print(f"[SERVER] Nonce check: {raw_body['nonce']}")
         if not check_and_store_nonce(raw_body['nonce']):
-            print(f"[SERVER] Nonce already used: {raw_body['nonce']}")
             raise HTTPException(status_code=400, detail="Nonce already used (replay attack detected)")
-        print(f"[SERVER] Nonce valid: {raw_body['nonce']}")
 
         # Step 2: Calculate body hash (exact same as client)
-        # The client creates: {messages, timestamp, nonce, request_id}
-        # The client hashes: 12169 characters
-        # The server should hash the exact same data
-
-        # Create the exact same structure as client
         body_dict = {
             "messages": raw_body["messages"],
             "timestamp": raw_body["timestamp"],
@@ -290,15 +269,9 @@ async def chat_completion(
             "request_id": raw_body["request_id"]
         }
 
-        # Debug: show what we're about to hash
-        print(f"[SERVER DEBUG] About to hash: {len(str(body_dict))} chars")
-        print(f"[SERVER DEBUG] Body dict sample: {str(body_dict)[:200]}...")
-
         body_hash = generate_body_hash(body_dict)
 
         # Step 3: Verify request signature
-        print(f"[SERVER] Verification: recv_sig={headers['signature'][:16]}...")
-
         signature_valid = verify_request_signature(
             headers["signature"],
             raw_body["timestamp"],
@@ -307,12 +280,8 @@ async def chat_completion(
             body_hash
         )
 
-        print(f"[SERVER] Result: valid={signature_valid}")
-
         if not signature_valid:
             raise HTTPException(status_code=401, detail="Invalid request signature")
-
-        print(f"[SERVER] All validations passed! Making OpenAI API call...")
 
         # Step 4: All validations passed - make OpenAI API call
         async with httpx.AsyncClient(timeout=60.0) as client:
