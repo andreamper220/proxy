@@ -276,6 +276,7 @@ async def chat_completion(
         )
         
         if not signature_valid:
+            print(headers, openai_request, body_hash, signature_valid)
             raise HTTPException(status_code=401, detail="Invalid request signature")
         
         # Step 4: All validations passed - make OpenAI API call
