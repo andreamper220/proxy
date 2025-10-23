@@ -26,6 +26,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SECRET_KEY = os.getenv("SECRET_KEY")  # Shared secret with extension
 ALLOWED_EXTENSION_ID = os.getenv("ALLOWED_EXTENSION_ID")
 MAX_REQUEST_AGE = 300  # 5 minutes - requests older than this are rejected
+# Proxy Configuration
+os.environ["HTTP_PROXY"] = "http://127.0.0.1:7890"
+os.environ["HTTPS_PROXY"] = "http://127.0.0.1:7890"
 
 # CORS configuration
 app.add_middleware(
