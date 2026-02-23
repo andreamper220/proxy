@@ -29,6 +29,10 @@ MAX_REQUEST_AGE = 300  # 5 minutes - requests older than this are rejected
 # Proxy Configuration
 os.environ["HTTP_PROXY"] = "http://127.0.0.1:7890"
 os.environ["HTTPS_PROXY"] = "http://127.0.0.1:7890"
+SUBSCRIPTION_EMAILS_FILE = os.getenv(
+    "GMAIL_APP_SUBSCRIPTIONS_FILE",
+    ".gmail_app_subscriptions.json"
+)
 
 # CORS configuration
 app.add_middleware(
@@ -93,6 +97,20 @@ class OpenAIRequest(BaseModel):
         return v
 
 
+class SubscriptionEmailsRequest(BaseModel):
+    """Security envelope for the subscription-emails endpoint (no payload needed)."""
+    timestamp: int
+    nonce: str
+    request_id: str
+
+    @validator('timestamp')
+    def validate_timestamp(cls, v):
+        current_time = int(time.time())
+        if abs(current_time - v) > MAX_REQUEST_AGE:
+            raise ValueError('Request timestamp is too old or invalid')
+        return v
+
+
 # Security Functions
 def generate_request_signature(
     timestamp: int,
@@ -130,7 +148,6 @@ def verify_request_signature(
 
 def generate_body_hash(body_dict: Dict[str, Any]) -> str:
     """Generate hash of request body for integrity verification"""
-    # Hash even simpler - just the individual values
     # Format: timestamp|nonce|request_id|message_count
     message_count = len(body_dict["messages"])
     hash_string = f"{body_dict['timestamp']}|{body_dict['nonce']}|{body_dict['request_id']}|{message_count}"
@@ -138,6 +155,13 @@ def generate_body_hash(body_dict: Dict[str, Any]) -> str:
     body_hash = hashlib.sha256(hash_string.encode('utf-8')).hexdigest()
 
     return body_hash
+
+
+def generate_simple_body_hash(body_dict: Dict[str, Any]) -> str:
+    """Generate hash for requests without a messages payload (e.g. subscription emails)"""
+    # Format: timestamp|nonce|request_id
+    hash_string = f"{body_dict['timestamp']}|{body_dict['nonce']}|{body_dict['request_id']}"
+    return hashlib.sha256(hash_string.encode('utf-8')).hexdigest()
 
 
 def verify_extension_headers(
@@ -219,6 +243,33 @@ def track_usage(fingerprint: str, model: str, tokens_used: int):
     if model not in stats["models_used"]:
         stats["models_used"][model] = 0
     stats["models_used"][model] += 1
+
+
+def load_gmail_app_subscription_emails() -> List[str]:
+    """Load gmail_app subscription emails from a local hidden file."""
+    if not os.path.exists(SUBSCRIPTION_EMAILS_FILE):
+        return []
+
+    try:
+        with open(SUBSCRIPTION_EMAILS_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to read subscription email file: {str(exc)}"
+        ) from exc
+
+    if not isinstance(payload, list):
+        raise HTTPException(
+            status_code=500,
+            detail="Subscription email file must be a JSON array"
+        )
+
+    return [
+        email.strip().lower()
+        for email in payload
+        if isinstance(email, str) and email.strip()
+    ]
 
 
 # API Endpoints
@@ -338,6 +389,51 @@ async def get_stats(
         "active_nonces": len(used_nonces),
         "clients": usage_stats
     }
+
+
+@app.post("/api/gmail_app/subscription-emails")
+async def get_gmail_app_subscription_emails(
+    request: Request,
+    headers: Dict[str, str] = Depends(verify_extension_headers)
+):
+    """
+    Return gmail_app subscription emails from local hidden file.
+    Protected with the same security stack as the OpenAI endpoints:
+    extension-header verification, timestamp freshness, nonce replay
+    prevention, and HMAC body-signature verification.
+    """
+    try:
+        raw_body = await request.json()
+
+        if not check_and_store_nonce(raw_body['nonce']):
+            raise HTTPException(status_code=400, detail="Nonce already used (replay attack detected)")
+
+        body_hash = generate_simple_body_hash({
+            "timestamp": raw_body["timestamp"],
+            "nonce": raw_body["nonce"],
+            "request_id": raw_body["request_id"],
+        })
+
+        if not verify_request_signature(
+            headers["signature"],
+            raw_body["timestamp"],
+            raw_body["nonce"],
+            raw_body["request_id"],
+            body_hash
+        ):
+            raise HTTPException(status_code=401, detail="Invalid request signature")
+
+        emails = load_gmail_app_subscription_emails()
+        return {
+            "count": len(emails),
+            "emails": emails
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error processing subscription-emails request: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.exception_handler(Exception)

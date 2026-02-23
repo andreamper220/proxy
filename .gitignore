@@ -1,6 +1,9 @@
 # Environment variables
 .env
 
+# Gmail app subscription emails (sensitive, local only)
+.gmail_app_subscriptions.json
+
 # Python
 __pycache__/
 *.py[cod]
