@@ -22,13 +22,17 @@ load_dotenv()
 app = FastAPI(title="Gmail Extension Backend", version="1.0.0")
 
 # Configuration
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# LLM: OpenAI by default, or Kie AI Gemini 3 Flash (OpenAI-compatible)
+# Kie: https://docs.kie.ai/30445303e0 → POST /gemini-3-flash/v1/chat/completions
+LLM_CHAT_URL = os.getenv(
+    "LLM_CHAT_URL",
+    "https://api.openai.com/v1/chat/completions",
+)
+LLM_API_KEY = os.getenv("KIE_API_KEY") or os.getenv("OPENAI_API_KEY")
+LLM_STREAM = os.getenv("LLM_STREAM", "false").lower() in ("1", "true", "yes")
 SECRET_KEY = os.getenv("SECRET_KEY")  # Shared secret with extension
 ALLOWED_EXTENSION_ID = os.getenv("ALLOWED_EXTENSION_ID")
 MAX_REQUEST_AGE = 300  # 5 minutes - requests older than this are rejected
-# Proxy Configuration
-os.environ["HTTP_PROXY"] = "http://127.0.0.1:7890"
-os.environ["HTTPS_PROXY"] = "http://127.0.0.1:7890"
 SUBSCRIPTION_EMAILS_FILE = os.getenv(
     "GMAIL_APP_SUBSCRIPTIONS_FILE",
     ".gmail_app_subscriptions.json"
@@ -289,7 +293,8 @@ async def health_check():
     """Detailed health check"""
     return {
         "status": "healthy",
-        "openai_configured": bool(OPENAI_API_KEY),
+        "llm_configured": bool(LLM_API_KEY),
+        "llm_chat_url": LLM_CHAT_URL,
         "secret_configured": bool(SECRET_KEY),
         "timestamp": int(time.time())
     }
@@ -334,29 +339,38 @@ async def chat_completion(
         if not signature_valid:
             raise HTTPException(status_code=401, detail="Invalid request signature")
 
-        # Step 4: All validations passed - make OpenAI API call
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            openai_response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                json={
-                    "model": raw_body.get("model", "gpt-4o-mini"),
-                    "messages": raw_body["messages"],
-                    "temperature": raw_body.get("temperature", 0.7),
-                    **({"max_tokens": raw_body["max_tokens"]} if raw_body.get("max_tokens") else {})
-                },
+        # Step 4: All validations passed - proxy to configured LLM API
+        if not LLM_API_KEY:
+            raise HTTPException(status_code=503, detail="LLM API key not configured")
+
+        upstream_payload: Dict[str, Any] = {
+            "messages": raw_body["messages"],
+            "temperature": raw_body.get("temperature", 0.7),
+            "stream": LLM_STREAM,
+        }
+        if raw_body.get("max_tokens"):
+            upstream_payload["max_tokens"] = raw_body["max_tokens"]
+        # OpenAI expects model in body; Kie Gemini uses model in URL path
+        if "api.openai.com" in LLM_CHAT_URL:
+            upstream_payload["model"] = raw_body.get("model", "gpt-4o-mini")
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            llm_response = await client.post(
+                LLM_CHAT_URL,
+                json=upstream_payload,
                 headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json"
-                }
+                    "Authorization": f"Bearer {LLM_API_KEY}",
+                    "Content-Type": "application/json",
+                },
             )
 
-            if openai_response.status_code != 200:
+            if llm_response.status_code != 200:
                 raise HTTPException(
-                    status_code=openai_response.status_code,
-                    detail=f"OpenAI API error: {openai_response.text}"
+                    status_code=llm_response.status_code,
+                    detail=f"LLM API error: {llm_response.text}",
                 )
 
-            result = openai_response.json()
+            result = llm_response.json()
 
             # Track usage
             tokens_used = result.get("usage", {}).get("total_tokens", 0)
