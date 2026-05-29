@@ -38,12 +38,13 @@ SUBSCRIPTION_EMAILS_FILE = os.getenv(
     ".gmail_app_subscriptions.json"
 )
 
-# CORS configuration
+# CORS: any chrome-extension:// origin (unpacked vs store ID differs).
+# Chat auth: X-Extension-Id must match ALLOWED_EXTENSION_ID.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[f"chrome-extension://{ALLOWED_EXTENSION_ID}"],
+    allow_origin_regex=r"^chrome-extension://.*$",
     allow_credentials=True,
-    allow_methods=["POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -294,13 +295,19 @@ async def root():
 
 @app.get("/api/health")
 async def health_check():
-    """Detailed health check"""
-    return {
-        "status": "healthy",
-        "openai_configured": bool(KIE_API_KEY),
-        "secret_configured": bool(SECRET_KEY),
-        "timestamp": int(time.time()),
-    }
+    """
+    Health check for the extension (openaiClient.testConnection).
+    Expects: data.status === 'healthy'
+    """
+    return JSONResponse(
+        content={
+            "status": "healthy",
+            "openai_configured": bool(KIE_API_KEY),
+            "secret_configured": bool(SECRET_KEY),
+            "timestamp": int(time.time()),
+        },
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.post("/api/openai/chat")
@@ -345,9 +352,6 @@ async def chat_completion(
         requested_model = raw_body.get("model", "gpt-4o-mini")
 
         # Step 4: All validations passed - proxy to Kie AI (OpenAI-compatible upstream)
-        if not KIE_API_KEY:
-            raise HTTPException(status_code=503, detail="OpenAI API key not configured")
-
         upstream_payload: Dict[str, Any] = {
             "messages": raw_body["messages"],
             "temperature": raw_body.get("temperature", 0.7),
