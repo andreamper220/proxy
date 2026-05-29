@@ -1,12 +1,12 @@
 """
 Gmail Extension Backend Server
-Handles OpenAI API requests with sophisticated security validation
+Proxies chat requests to Kie AI (Gemini 3 Flash, OpenAI-compatible API)
 """
 from fastapi import FastAPI, HTTPException, Header, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, validator
-from typing import List, Optional, Dict, Any
+from typing import List, Dict, Any, Optional, Union
 import os
 import hashlib
 import hmac
@@ -21,15 +21,15 @@ load_dotenv()
 
 app = FastAPI(title="Gmail Extension Backend", version="1.0.0")
 
-# Configuration
-# LLM: OpenAI by default, or Kie AI Gemini 3 Flash (OpenAI-compatible)
-# Kie: https://docs.kie.ai/30445303e0 → POST /gemini-3-flash/v1/chat/completions
-LLM_CHAT_URL = os.getenv(
-    "LLM_CHAT_URL",
-    "https://api.openai.com/v1/chat/completions",
+# Configuration — Kie AI Gemini 3 Flash (OpenAI-compatible)
+# https://docs.kie.ai/30445303e0 → POST /gemini-3-flash/v1/chat/completions
+# OPENAI_API_KEY kept as env alias so existing server .env keeps working
+KIE_API_KEY = os.getenv("KIE_API_KEY") or os.getenv("OPENAI_API_KEY")
+KIE_CHAT_URL = os.getenv(
+    "KIE_CHAT_URL",
+    "https://api.kie.ai/gemini-3-flash/v1/chat/completions",
 )
-LLM_API_KEY = os.getenv("KIE_API_KEY") or os.getenv("OPENAI_API_KEY")
-LLM_STREAM = os.getenv("LLM_STREAM", "false").lower() in ("1", "true", "yes")
+KIE_STREAM = os.getenv("KIE_STREAM", "false").lower() in ("1", "true", "yes")
 SECRET_KEY = os.getenv("SECRET_KEY")  # Shared secret with extension
 ALLOWED_EXTENSION_ID = os.getenv("ALLOWED_EXTENSION_ID")
 MAX_REQUEST_AGE = 300  # 5 minutes - requests older than this are rejected
@@ -49,58 +49,6 @@ app.add_middleware(
 
 
 # Request Models
-class Message(BaseModel):
-    role: str
-    content: str
-
-    @validator('role')
-    def validate_role(cls, v):
-        if v not in ['system', 'user', 'assistant']:
-            raise ValueError('Invalid role')
-        return v
-
-
-class OpenAIRequest(BaseModel):
-    messages: List[Message]
-    model: Optional[str] = "gpt-3.5-turbo"
-    temperature: Optional[float] = 0.7
-    max_tokens: Optional[int] = None
-
-    # Security parameters
-    timestamp: int
-    nonce: str
-    request_id: str
-
-    @validator('timestamp')
-    def validate_timestamp(cls, v):
-        current_time = int(time.time())
-        if abs(current_time - v) > MAX_REQUEST_AGE:
-            raise ValueError('Request timestamp is too old or invalid')
-        return v
-
-    @validator('messages')
-    def validate_messages(cls, v):
-        if not v or len(v) == 0:
-            raise ValueError('Messages cannot be empty')
-        if len(v) > 50:
-            raise ValueError('Too many messages')
-        return v
-
-    @validator('model')
-    def validate_model(cls, v):
-        allowed_models = [
-            'gpt-3.5-turbo',
-            'gpt-3.5-turbo-16k',
-            'gpt-4',
-            'gpt-4-turbo-preview',
-            'gpt-4-turbo',
-            'gpt-4o-mini',
-        ]
-        if v not in allowed_models:
-            raise ValueError(f'Model {v} not allowed')
-        return v
-
-
 class SubscriptionEmailsRequest(BaseModel):
     """Security envelope for the subscription-emails endpoint (no payload needed)."""
     timestamp: int
@@ -228,6 +176,62 @@ def check_and_store_nonce(nonce: str) -> bool:
 usage_stats = {}
 
 
+def extract_message_content(content: Union[str, List[Any], Dict[str, Any], None]) -> str:
+    """Normalize assistant content to a plain string (OpenAI chat.completion shape)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text" and "text" in item:
+                    parts.append(str(item["text"]))
+                elif "text" in item:
+                    parts.append(str(item["text"]))
+        return "".join(parts)
+    if isinstance(content, dict) and "text" in content:
+        return str(content["text"])
+    return str(content)
+
+
+def normalize_chat_completion_response(
+    payload: Dict[str, Any],
+    requested_model: str,
+) -> Dict[str, Any]:
+    """
+    Ensure the payload matches what the Chrome extension expects from OpenAI:
+    choices[].message.content as a string, plus id/object/usage when present.
+    """
+    if payload.get("code") and payload.get("msg") and "choices" not in payload:
+        raise HTTPException(
+            status_code=502,
+            detail=f"OpenAI API error: {payload.get('msg', payload)}",
+        )
+
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise HTTPException(
+            status_code=502,
+            detail="OpenAI API error: invalid response (no choices)",
+        )
+
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if isinstance(message, dict) and "content" in message:
+            message["content"] = extract_message_content(message.get("content"))
+
+    if not payload.get("model"):
+        payload["model"] = requested_model
+    if not payload.get("object"):
+        payload["object"] = "chat.completion"
+
+    return payload
+
+
 def track_usage(fingerprint: str, model: str, tokens_used: int):
     """Track API usage per client fingerprint"""
     if fingerprint not in usage_stats:
@@ -293,10 +297,9 @@ async def health_check():
     """Detailed health check"""
     return {
         "status": "healthy",
-        "llm_configured": bool(LLM_API_KEY),
-        "llm_chat_url": LLM_CHAT_URL,
+        "openai_configured": bool(KIE_API_KEY),
         "secret_configured": bool(SECRET_KEY),
-        "timestamp": int(time.time())
+        "timestamp": int(time.time()),
     }
 
 
@@ -306,8 +309,8 @@ async def chat_completion(
     headers: Dict[str, str] = Depends(verify_extension_headers)
 ):
     """
-    Main endpoint for OpenAI chat completions
-    Validates all security parameters before proxying to OpenAI
+    Chat completions via Kie AI Gemini 3 Flash.
+    Validates security parameters before proxying upstream.
     """
     try:
         # Get raw request body
@@ -339,42 +342,48 @@ async def chat_completion(
         if not signature_valid:
             raise HTTPException(status_code=401, detail="Invalid request signature")
 
-        # Step 4: All validations passed - proxy to configured LLM API
-        if not LLM_API_KEY:
-            raise HTTPException(status_code=503, detail="LLM API key not configured")
+        requested_model = raw_body.get("model", "gpt-4o-mini")
+
+        # Step 4: All validations passed - proxy to Kie AI (OpenAI-compatible upstream)
+        if not KIE_API_KEY:
+            raise HTTPException(status_code=503, detail="OpenAI API key not configured")
 
         upstream_payload: Dict[str, Any] = {
             "messages": raw_body["messages"],
             "temperature": raw_body.get("temperature", 0.7),
-            "stream": LLM_STREAM,
+            "stream": KIE_STREAM,
         }
         if raw_body.get("max_tokens"):
             upstream_payload["max_tokens"] = raw_body["max_tokens"]
-        # OpenAI expects model in body; Kie Gemini uses model in URL path
-        if "api.openai.com" in LLM_CHAT_URL:
-            upstream_payload["model"] = raw_body.get("model", "gpt-4o-mini")
 
         async with httpx.AsyncClient(timeout=120.0) as client:
-            llm_response = await client.post(
-                LLM_CHAT_URL,
+            kie_response = await client.post(
+                KIE_CHAT_URL,
                 json=upstream_payload,
                 headers={
-                    "Authorization": f"Bearer {LLM_API_KEY}",
+                    "Authorization": f"Bearer {KIE_API_KEY}",
                     "Content-Type": "application/json",
                 },
             )
 
-            if llm_response.status_code != 200:
+            if kie_response.status_code != 200:
                 raise HTTPException(
-                    status_code=llm_response.status_code,
-                    detail=f"LLM API error: {llm_response.text}",
+                    status_code=kie_response.status_code,
+                    detail=f"OpenAI API error: {kie_response.text}",
                 )
 
-            result = llm_response.json()
+            try:
+                result = kie_response.json()
+            except json.JSONDecodeError as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"OpenAI API error: invalid JSON response ({exc})",
+                ) from exc
 
-            # Track usage
+            result = normalize_chat_completion_response(result, requested_model)
+
             tokens_used = result.get("usage", {}).get("total_tokens", 0)
-            track_usage(headers["fingerprint"], raw_body.get("model", "gpt-4o-mini"), tokens_used)
+            track_usage(headers["fingerprint"], requested_model, tokens_used)
 
             return result
 
@@ -412,7 +421,7 @@ async def get_gmail_app_subscription_emails(
 ):
     """
     Return gmail_app subscription emails from local hidden file.
-    Protected with the same security stack as the OpenAI endpoints:
+    Protected with the same security stack as the chat endpoint:
     extension-header verification, timestamp freshness, nonce replay
     prevention, and HMAC body-signature verification.
     """

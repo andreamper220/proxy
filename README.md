@@ -1,6 +1,6 @@
 # Gmail Extension Backend Server
 
-Python FastAPI backend for handling OpenAI API requests with sophisticated security validation.
+Python FastAPI backend that proxies chat requests to Kie AI (Gemini 3 Flash) with security validation.
 
 ## Features
 
@@ -16,10 +16,9 @@ Python FastAPI backend for handling OpenAI API requests with sophisticated secur
   - Token usage tracking
   - Request counting
 
-- **OpenAI Proxy**
-  - Secure API key storage
-  - Request validation before proxying
-  - Support for multiple GPT models
+- **Kie AI Proxy**
+  - Secure API key storage (`KIE_API_KEY`)
+  - Request validation before proxying to Gemini 3 Flash
 
 ## Setup
 
@@ -49,11 +48,12 @@ cp .env.example .env
 
 Edit `.env`:
 ```
-OPENAI_API_KEY=sk-proj-your-actual-key
+KIE_API_KEY=your-kie-api-key
 SECRET_KEY=generate-a-random-32-character-string
 ADMIN_KEY=another-random-string-for-admin-access
 ALLOWED_EXTENSION_ID=your-chrome-extension-id
-PORT=8000
+PORT=8005
+KIE_STREAM=false
 ```
 
 **Important**: The `SECRET_KEY` must match the one in your extension's client-side code!
@@ -102,7 +102,6 @@ POST /api/openai/chat
   "messages": [
     {"role": "user", "content": "Hello"}
   ],
-  "model": "gpt-3.5-turbo",
   "temperature": 0.7,
   "timestamp": 1698765432,
   "nonce": "random-unique-string",
@@ -145,7 +144,7 @@ Unique identifier for each client installation, used for usage tracking.
 ```bash
 # Install Heroku CLI, then:
 heroku create your-app-name
-heroku config:set OPENAI_API_KEY=your-key
+heroku config:set KIE_API_KEY=your-key
 heroku config:set SECRET_KEY=your-secret
 heroku config:set ALLOWED_EXTENSION_ID=your-extension-id
 git push heroku master
@@ -212,10 +211,10 @@ Test with the extension running, or use the test script (create one if needed).
 - Check that timestamp is being generated correctly
 - Verify body hash calculation matches on both sides
 
-### OpenAI API Errors
-- Check your `OPENAI_API_KEY` is valid
-- Verify you have credits in your OpenAI account
-- Check the model name is correct
+### Kie AI API Errors
+- Check your `KIE_API_KEY` is valid (https://kie.ai/api-key)
+- Verify account credits on Kie.ai
+- Ensure `KIE_STREAM=false` unless the client handles SSE
 
 ## Support
 
