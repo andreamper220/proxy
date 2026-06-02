@@ -33,6 +33,8 @@ KIE_STREAM = os.getenv("KIE_STREAM", "false").lower() in ("1", "true", "yes")
 SECRET_KEY = os.getenv("SECRET_KEY")  # Shared secret with extension
 ALLOWED_EXTENSION_ID = os.getenv("ALLOWED_EXTENSION_ID")
 MAX_REQUEST_AGE = 300  # 5 minutes - requests older than this are rejected
+MAX_TRANSLATE_TEXT_LENGTH = int(os.getenv("MAX_TRANSLATE_TEXT_LENGTH", "5000"))
+GOOGLE_TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
 SUBSCRIPTION_EMAILS_FILE = os.getenv(
     "GMAIL_APP_SUBSCRIPTIONS_FILE",
     ".gmail_app_subscriptions.json"
@@ -50,8 +52,8 @@ app.add_middleware(
 
 
 # Request Models
-class SubscriptionEmailsRequest(BaseModel):
-    """Security envelope for the subscription-emails endpoint (no payload needed)."""
+class SignedProxyRequest(BaseModel):
+    """Security envelope for signed proxy endpoints without a messages payload."""
     timestamp: int
     nonce: str
     request_id: str
@@ -62,6 +64,31 @@ class SubscriptionEmailsRequest(BaseModel):
         if abs(current_time - v) > MAX_REQUEST_AGE:
             raise ValueError('Request timestamp is too old or invalid')
         return v
+
+
+class SubscriptionEmailsRequest(SignedProxyRequest):
+    """Security envelope for the subscription-emails endpoint (no payload needed)."""
+    pass
+
+
+class TranslateRequest(SignedProxyRequest):
+    text: str
+    target_lang: str
+    source_lang: str = "auto"
+
+    @validator('text')
+    def validate_text(cls, v):
+        if not v or not v.strip():
+            raise ValueError('text is required')
+        if len(v) > MAX_TRANSLATE_TEXT_LENGTH:
+            raise ValueError(f'text exceeds {MAX_TRANSLATE_TEXT_LENGTH} characters')
+        return v
+
+    @validator('target_lang')
+    def validate_target_lang(cls, v):
+        if not v or not v.strip():
+            raise ValueError('target_lang is required')
+        return v.strip()
 
 
 # Security Functions
@@ -254,6 +281,83 @@ def track_usage(fingerprint: str, model: str, tokens_used: int):
     stats["models_used"][model] += 1
 
 
+def normalize_google_translate_lang(lang: str) -> str:
+    """Map extension locale codes to Google Translate language codes."""
+    if not lang:
+        return "en"
+    mapping = {
+        "iw": "he",
+        "en-GB": "en",
+        "pt-BR": "pt",
+        "pt-PT": "pt",
+        "fr-CA": "fr",
+    }
+    return mapping.get(lang, lang)
+
+
+def parse_google_translate_response(data: Any) -> str:
+    if not isinstance(data, list) or not data or not isinstance(data[0], list):
+        raise HTTPException(status_code=502, detail="Invalid translate response")
+    translated_parts: List[str] = []
+    for part in data[0]:
+        if isinstance(part, list) and part and part[0]:
+            translated_parts.append(str(part[0]))
+    if not translated_parts:
+        raise HTTPException(status_code=502, detail="Empty translate response")
+    return "".join(translated_parts)
+
+
+async def google_translate_text(text: str, target_lang: str, source_lang: str = "auto") -> str:
+    tl = normalize_google_translate_lang(target_lang)
+    sl = "auto" if not source_lang or source_lang == "auto" else normalize_google_translate_lang(source_lang)
+    params = {
+        "client": "gtx",
+        "sl": sl,
+        "tl": tl,
+        "dt": "t",
+        "q": text,
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(GOOGLE_TRANSLATE_URL, params=params)
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Translate upstream error: {response.text[:200]}",
+        )
+    try:
+        payload = response.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Invalid translate JSON: {exc}",
+        ) from exc
+    return parse_google_translate_response(payload)
+
+
+async def verify_signed_proxy_request(
+    raw_body: Dict[str, Any],
+    signature: str,
+) -> None:
+    if not check_and_store_nonce(raw_body["nonce"]):
+        raise HTTPException(
+            status_code=400,
+            detail="Nonce already used (replay attack detected)",
+        )
+    body_hash = generate_simple_body_hash({
+        "timestamp": raw_body["timestamp"],
+        "nonce": raw_body["nonce"],
+        "request_id": raw_body["request_id"],
+    })
+    if not verify_request_signature(
+        signature,
+        raw_body["timestamp"],
+        raw_body["nonce"],
+        raw_body["request_id"],
+        body_hash,
+    ):
+        raise HTTPException(status_code=401, detail="Invalid request signature")
+
+
 def load_gmail_app_subscription_emails() -> List[str]:
     """Load gmail_app subscription emails from a local hidden file."""
     if not os.path.exists(SUBSCRIPTION_EMAILS_FILE):
@@ -431,24 +535,7 @@ async def get_gmail_app_subscription_emails(
     """
     try:
         raw_body = await request.json()
-
-        if not check_and_store_nonce(raw_body['nonce']):
-            raise HTTPException(status_code=400, detail="Nonce already used (replay attack detected)")
-
-        body_hash = generate_simple_body_hash({
-            "timestamp": raw_body["timestamp"],
-            "nonce": raw_body["nonce"],
-            "request_id": raw_body["request_id"],
-        })
-
-        if not verify_request_signature(
-            headers["signature"],
-            raw_body["timestamp"],
-            raw_body["nonce"],
-            raw_body["request_id"],
-            body_hash
-        ):
-            raise HTTPException(status_code=401, detail="Invalid request signature")
+        await verify_signed_proxy_request(raw_body, headers["signature"])
 
         emails = load_gmail_app_subscription_emails()
         return {
@@ -460,6 +547,33 @@ async def get_gmail_app_subscription_emails(
         raise
     except Exception as e:
         print(f"Error processing subscription-emails request: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.post("/api/translate")
+async def translate_text(
+    request: Request,
+    headers: Dict[str, str] = Depends(verify_extension_headers),
+):
+    """
+    Translate text via Google Translate (server-side upstream).
+    Same signed-request security as subscription-emails.
+    """
+    try:
+        raw_body = await request.json()
+        await verify_signed_proxy_request(raw_body, headers["signature"])
+
+        translated = await google_translate_text(
+            raw_body["text"],
+            raw_body["target_lang"],
+            raw_body.get("source_lang", "auto"),
+        )
+        return {"translated": translated}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error processing translate request: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
