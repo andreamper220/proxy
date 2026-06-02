@@ -38,6 +38,8 @@ MAX_TRANSLATE_TEXT_LENGTH = int(os.getenv("MAX_TRANSLATE_TEXT_LENGTH", "5000"))
 GOOGLE_TRANSLATE_API_KEY = os.getenv("GOOGLE_TRANSLATE_API_KEY") or os.getenv("GOOGLE_CLOUD_API_KEY")
 GOOGLE_CLOUD_TRANSLATE_URL = "https://translation.googleapis.com/language/translate/v2"
 GOOGLE_CLOUD_TRANSLATE_CHUNK = int(os.getenv("GOOGLE_CLOUD_TRANSLATE_CHUNK", "4500"))
+GOOGLE_CLOUD_TRANSLATE_HTML_CHUNK = int(os.getenv("GOOGLE_CLOUD_TRANSLATE_HTML_CHUNK", "12000"))
+MAX_TRANSLATE_CHUNKS_PER_REQUEST = int(os.getenv("MAX_TRANSLATE_CHUNKS_PER_REQUEST", "16"))
 SUBSCRIPTION_EMAILS_FILE = os.getenv(
     "GMAIL_APP_SUBSCRIPTIONS_FILE",
     ".gmail_app_subscriptions.json"
@@ -318,12 +320,13 @@ def split_text_for_translation(text: str, max_len: int) -> List[str]:
     return chunks
 
 
-async def google_cloud_translate_text(
-    text: str,
+async def google_cloud_translate(
+    q: Union[str, List[str]],
     target_lang: str,
     source_lang: str = "auto",
-) -> str:
-    """Official Google Cloud Translation API v2."""
+    fmt: str = "text",
+) -> Union[str, List[str]]:
+    """Official Google Cloud Translation API v2 (text or html format)."""
     if not GOOGLE_TRANSLATE_API_KEY:
         raise HTTPException(
             status_code=503,
@@ -333,16 +336,21 @@ async def google_cloud_translate_text(
             ),
         )
 
+    single = isinstance(q, str)
+    q_list: List[str] = [q] if single else list(q)
+    if not q_list:
+        raise HTTPException(status_code=400, detail="Nothing to translate")
+
     tl = normalize_google_translate_lang(target_lang)
     body: Dict[str, Any] = {
-        "q": text,
+        "q": q_list if not single else q_list[0],
         "target": tl,
-        "format": "text",
+        "format": fmt if fmt in ("text", "html") else "text",
     }
     if source_lang and source_lang != "auto":
         body["source"] = normalize_google_translate_lang(source_lang)
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=60.0) as client:
         response = await client.post(
             GOOGLE_CLOUD_TRANSLATE_URL,
             params={"key": GOOGLE_TRANSLATE_API_KEY},
@@ -365,20 +373,47 @@ async def google_cloud_translate_text(
         ) from exc
 
     translations = payload.get("data", {}).get("translations")
-    if not translations or not translations[0].get("translatedText"):
+    if not translations:
         raise HTTPException(status_code=502, detail="Google Cloud Translation API empty response")
 
-    return str(translations[0]["translatedText"])
+    results: List[str] = []
+    for item in translations:
+        translated = item.get("translatedText")
+        if not translated:
+            raise HTTPException(status_code=502, detail="Google Cloud Translation API empty segment")
+        results.append(str(translated))
+
+    if single:
+        return results[0]
+    return results
+
+
+async def translate_html_chunks_upstream(
+    chunks: List[str],
+    target_lang: str,
+    source_lang: str = "auto",
+) -> List[str]:
+    """Translate HTML chunks, batching multiple segments per API request."""
+    translated: List[str] = []
+    for index in range(0, len(chunks), MAX_TRANSLATE_CHUNKS_PER_REQUEST):
+        batch = chunks[index:index + MAX_TRANSLATE_CHUNKS_PER_REQUEST]
+        batch_result = await google_cloud_translate(
+            batch, target_lang, source_lang, fmt="html"
+        )
+        if isinstance(batch_result, str):
+            translated.append(batch_result)
+        else:
+            translated.extend(batch_result)
+    return translated
 
 
 async def translate_text_upstream(text: str, target_lang: str, source_lang: str = "auto") -> str:
-    """Translate via Google Cloud Translation API (chunked for long text)."""
-    chunks = split_text_for_translation(text, GOOGLE_CLOUD_TRANSLATE_CHUNK)
+    """Translate plain text via Google Cloud Translation API (chunked for long text)."""
+    parts = split_text_for_translation(text, GOOGLE_CLOUD_TRANSLATE_CHUNK)
     translated_chunks: List[str] = []
-    for chunk in chunks:
-        translated_chunks.append(
-            await google_cloud_translate_text(chunk, target_lang, source_lang)
-        )
+    for chunk in parts:
+        result = await google_cloud_translate(chunk, target_lang, source_lang, fmt="text")
+        translated_chunks.append(result if isinstance(result, str) else result[0])
     return "".join(translated_chunks)
 
 
@@ -612,11 +647,40 @@ async def translate_text(
         raw_body = await request.json()
         await verify_signed_proxy_request(raw_body, headers["signature"])
 
-        translated = await translate_text_upstream(
-            raw_body["text"],
-            raw_body["target_lang"],
-            raw_body.get("source_lang", "auto"),
-        )
+        target_lang = raw_body["target_lang"]
+        source_lang = raw_body.get("source_lang", "auto")
+        chunks = raw_body.get("chunks")
+
+        if chunks is not None:
+            if not isinstance(chunks, list) or not chunks:
+                raise HTTPException(status_code=400, detail="chunks must be a non-empty array")
+            for chunk in chunks:
+                if not isinstance(chunk, str):
+                    raise HTTPException(status_code=400, detail="each chunk must be a string")
+                if len(chunk) > MAX_TRANSLATE_TEXT_LENGTH:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"chunk exceeds {MAX_TRANSLATE_TEXT_LENGTH} characters",
+                    )
+            translated_chunks = await translate_html_chunks_upstream(
+                chunks, target_lang, source_lang
+            )
+            return {
+                "translated_chunks": translated_chunks,
+                "translated": "".join(translated_chunks),
+            }
+
+        text = raw_body.get("text")
+        if not text or not str(text).strip():
+            raise HTTPException(status_code=400, detail="text or chunks is required")
+
+        fmt = raw_body.get("format", "text")
+        if fmt == "html":
+            translated = await google_cloud_translate(
+                str(text), target_lang, source_lang, fmt="html"
+            )
+        else:
+            translated = await translate_text_upstream(str(text), target_lang, source_lang)
         return {"translated": translated}
 
     except HTTPException:
