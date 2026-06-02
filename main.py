@@ -34,6 +34,8 @@ SECRET_KEY = os.getenv("SECRET_KEY")  # Shared secret with extension
 ALLOWED_EXTENSION_ID = os.getenv("ALLOWED_EXTENSION_ID")
 MAX_REQUEST_AGE = 300  # 5 minutes - requests older than this are rejected
 MAX_TRANSLATE_TEXT_LENGTH = int(os.getenv("MAX_TRANSLATE_TEXT_LENGTH", "5000"))
+# HTML chunks (format=html) — Google Cloud Translation v2 basic allows ~100 KB per request
+MAX_TRANSLATE_HTML_LENGTH = int(os.getenv("MAX_TRANSLATE_HTML_LENGTH", "102400"))
 # Official Google Cloud Translation API v2 (https://cloud.google.com/translate/docs/reference/rest/v2/translate/translateText)
 GOOGLE_TRANSLATE_API_KEY = os.getenv("GOOGLE_TRANSLATE_API_KEY") or os.getenv("GOOGLE_CLOUD_API_KEY")
 GOOGLE_CLOUD_TRANSLATE_URL = "https://translation.googleapis.com/language/translate/v2"
@@ -657,10 +659,10 @@ async def translate_text(
             for chunk in chunks:
                 if not isinstance(chunk, str):
                     raise HTTPException(status_code=400, detail="each chunk must be a string")
-                if len(chunk) > MAX_TRANSLATE_TEXT_LENGTH:
+                if len(chunk) > MAX_TRANSLATE_HTML_LENGTH:
                     raise HTTPException(
                         status_code=400,
-                        detail=f"chunk exceeds {MAX_TRANSLATE_TEXT_LENGTH} characters",
+                        detail=f"chunk exceeds {MAX_TRANSLATE_HTML_LENGTH} characters",
                     )
             translated_chunks = await translate_html_chunks_upstream(
                 chunks, target_lang, source_lang
