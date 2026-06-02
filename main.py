@@ -34,7 +34,10 @@ SECRET_KEY = os.getenv("SECRET_KEY")  # Shared secret with extension
 ALLOWED_EXTENSION_ID = os.getenv("ALLOWED_EXTENSION_ID")
 MAX_REQUEST_AGE = 300  # 5 minutes - requests older than this are rejected
 MAX_TRANSLATE_TEXT_LENGTH = int(os.getenv("MAX_TRANSLATE_TEXT_LENGTH", "5000"))
-GOOGLE_TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
+# Official Google Cloud Translation API v2 (https://cloud.google.com/translate/docs/reference/rest/v2/translate/translateText)
+GOOGLE_TRANSLATE_API_KEY = os.getenv("GOOGLE_TRANSLATE_API_KEY") or os.getenv("GOOGLE_CLOUD_API_KEY")
+GOOGLE_CLOUD_TRANSLATE_URL = "https://translation.googleapis.com/language/translate/v2"
+GOOGLE_CLOUD_TRANSLATE_CHUNK = int(os.getenv("GOOGLE_CLOUD_TRANSLATE_CHUNK", "4500"))
 SUBSCRIPTION_EMAILS_FILE = os.getenv(
     "GMAIL_APP_SUBSCRIPTIONS_FILE",
     ".gmail_app_subscriptions.json"
@@ -295,43 +298,88 @@ def normalize_google_translate_lang(lang: str) -> str:
     return mapping.get(lang, lang)
 
 
-def parse_google_translate_response(data: Any) -> str:
-    if not isinstance(data, list) or not data or not isinstance(data[0], list):
-        raise HTTPException(status_code=502, detail="Invalid translate response")
-    translated_parts: List[str] = []
-    for part in data[0]:
-        if isinstance(part, list) and part and part[0]:
-            translated_parts.append(str(part[0]))
-    if not translated_parts:
-        raise HTTPException(status_code=502, detail="Empty translate response")
-    return "".join(translated_parts)
+def split_text_for_translation(text: str, max_len: int) -> List[str]:
+    """Split long text into chunks suitable for translation APIs."""
+    if len(text) <= max_len:
+        return [text]
+    chunks: List[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= max_len:
+            chunks.append(remaining)
+            break
+        split_at = remaining.rfind("\n", 0, max_len)
+        if split_at < max_len // 3:
+            split_at = remaining.rfind(" ", 0, max_len)
+        if split_at < max_len // 3:
+            split_at = max_len
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:]
+    return chunks
 
 
-async def google_translate_text(text: str, target_lang: str, source_lang: str = "auto") -> str:
+async def google_cloud_translate_text(
+    text: str,
+    target_lang: str,
+    source_lang: str = "auto",
+) -> str:
+    """Official Google Cloud Translation API v2."""
+    if not GOOGLE_TRANSLATE_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Google Cloud Translation API key is not configured. "
+                "Set GOOGLE_TRANSLATE_API_KEY in the proxy server environment."
+            ),
+        )
+
     tl = normalize_google_translate_lang(target_lang)
-    sl = "auto" if not source_lang or source_lang == "auto" else normalize_google_translate_lang(source_lang)
-    params = {
-        "client": "gtx",
-        "sl": sl,
-        "tl": tl,
-        "dt": "t",
+    body: Dict[str, Any] = {
         "q": text,
+        "target": tl,
+        "format": "text",
     }
+    if source_lang and source_lang != "auto":
+        body["source"] = normalize_google_translate_lang(source_lang)
+
     async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(GOOGLE_TRANSLATE_URL, params=params)
+        response = await client.post(
+            GOOGLE_CLOUD_TRANSLATE_URL,
+            params={"key": GOOGLE_TRANSLATE_API_KEY},
+            json=body,
+        )
+
     if response.status_code != 200:
+        detail = response.text[:300]
         raise HTTPException(
             status_code=502,
-            detail=f"Translate upstream error: {response.text[:200]}",
+            detail=f"Google Cloud Translation API error ({response.status_code}): {detail}",
         )
+
     try:
         payload = response.json()
     except json.JSONDecodeError as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"Invalid translate JSON: {exc}",
+            detail=f"Google Cloud Translation API invalid JSON: {exc}",
         ) from exc
-    return parse_google_translate_response(payload)
+
+    translations = payload.get("data", {}).get("translations")
+    if not translations or not translations[0].get("translatedText"):
+        raise HTTPException(status_code=502, detail="Google Cloud Translation API empty response")
+
+    return str(translations[0]["translatedText"])
+
+
+async def translate_text_upstream(text: str, target_lang: str, source_lang: str = "auto") -> str:
+    """Translate via Google Cloud Translation API (chunked for long text)."""
+    chunks = split_text_for_translation(text, GOOGLE_CLOUD_TRANSLATE_CHUNK)
+    translated_chunks: List[str] = []
+    for chunk in chunks:
+        translated_chunks.append(
+            await google_cloud_translate_text(chunk, target_lang, source_lang)
+        )
+    return "".join(translated_chunks)
 
 
 async def verify_signed_proxy_request(
@@ -407,6 +455,7 @@ async def health_check():
         content={
             "status": "healthy",
             "openai_configured": bool(KIE_API_KEY),
+            "translate_configured": bool(GOOGLE_TRANSLATE_API_KEY),
             "secret_configured": bool(SECRET_KEY),
             "timestamp": int(time.time()),
         },
@@ -563,7 +612,7 @@ async def translate_text(
         raw_body = await request.json()
         await verify_signed_proxy_request(raw_body, headers["signature"])
 
-        translated = await google_translate_text(
+        translated = await translate_text_upstream(
             raw_body["text"],
             raw_body["target_lang"],
             raw_body.get("source_lang", "auto"),

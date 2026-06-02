@@ -20,6 +20,10 @@ Python FastAPI backend that proxies chat requests to Kie AI (Gemini 3 Flash) wit
   - Secure API key storage (`KIE_API_KEY`)
   - Request validation before proxying to Gemini 3 Flash
 
+- **Email translation** (`POST /api/translate`)
+  - Official [Google Cloud Translation API](https://cloud.google.com/translate/docs) (not the free web widget)
+  - API key stored only on the server (`GOOGLE_TRANSLATE_API_KEY`)
+
 ## Setup
 
 ### 1. Install Python Dependencies
@@ -49,12 +53,23 @@ cp .env.example .env
 Edit `.env`:
 ```
 KIE_API_KEY=your-kie-api-key
+GOOGLE_TRANSLATE_API_KEY=your-google-cloud-translation-api-key
 SECRET_KEY=generate-a-random-32-character-string
 ADMIN_KEY=another-random-string-for-admin-access
 ALLOWED_EXTENSION_ID=your-chrome-extension-id
 PORT=8005
 KIE_STREAM=false
 ```
+
+### Google Cloud Translation API (for `/api/translate`)
+
+1. In [Google Cloud Console](https://console.cloud.google.com/), create or select a project.
+2. Enable **Cloud Translation API**.
+3. Create an API key (Credentials → Create credentials → API key).
+4. Restrict the key to **Cloud Translation API** only.
+5. Set `GOOGLE_TRANSLATE_API_KEY` in `.env` on the proxy server.
+
+Billing applies per Google’s pricing (free tier may apply for low volume). This is the supported API for server-side translation; the public `translate.google.com` endpoint used in browsers is not intended for backend use and is often blocked (captcha / 302).
 
 **Important**: The `SECRET_KEY` must match the one in your extension's client-side code!
 
