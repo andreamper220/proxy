@@ -31,6 +31,7 @@ KIE_CHAT_URL = os.getenv(
     "KIE_CHAT_URL",
     "https://api.kie.ai/gemini-3-flash/v1/chat/completions",
 )
+DEFAULT_KIE_FALLBACK_URL = "https://api.kie.ai/gemini-3-5-flash-openai/v1/chat/completions"
 KIE_STREAM = os.getenv("KIE_STREAM", "false").lower() in ("1", "true", "yes")
 KIE_MAX_RETRIES = int(os.getenv("KIE_MAX_RETRIES", "4"))
 KIE_RETRY_BASE_DELAY = float(os.getenv("KIE_RETRY_BASE_DELAY", "2.0"))
@@ -256,6 +257,28 @@ def extract_message_content(content: Union[str, List[Any], Dict[str, Any], None]
     return str(content)
 
 
+def get_kie_chat_urls() -> List[str]:
+    """Primary Kie chat URL plus optional fallback endpoints."""
+    urls: List[str] = []
+    primary = (KIE_CHAT_URL or "").strip()
+    if primary:
+        urls.append(primary)
+    fallback_env = os.getenv("KIE_CHAT_FALLBACK_URL", "")
+    if fallback_env:
+        for item in fallback_env.split(","):
+            item = item.strip()
+            if item and item not in urls:
+                urls.append(item)
+    elif DEFAULT_KIE_FALLBACK_URL not in urls:
+        urls.append(DEFAULT_KIE_FALLBACK_URL)
+    return urls
+
+
+def is_kie_fallback_worthy_error(detail: str) -> bool:
+    lowered = detail.lower()
+    return KIE_MAINTENANCE_PHRASE in lowered or "rate limit" in lowered
+
+
 def is_kie_retryable_response(
     http_status: int,
     payload: Optional[Dict[str, Any]],
@@ -277,8 +300,11 @@ def is_kie_retryable_response(
     return False
 
 
-async def kie_chat_completion(upstream_payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Call Kie AI chat completions with retries for transient upstream failures."""
+async def kie_chat_completion_to_url(
+    chat_url: str,
+    upstream_payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Call one Kie chat endpoint with retries for transient upstream failures."""
     last_http_status = 502
     last_payload: Dict[str, Any] = {}
     last_text = ""
@@ -288,7 +314,7 @@ async def kie_chat_completion(upstream_payload: Dict[str, Any]) -> Dict[str, Any
     async with httpx.AsyncClient(timeout=kie_timeout) as client:
         for attempt in range(KIE_MAX_RETRIES + 1):
             kie_response = await client.post(
-                KIE_CHAT_URL,
+                chat_url,
                 json=upstream_payload,
                 headers={
                     "Authorization": f"Bearer {KIE_API_KEY}",
@@ -322,8 +348,9 @@ async def kie_chat_completion(upstream_payload: Dict[str, Any]) -> Dict[str, Any
                     )
                     break
                 print(
-                    f"[KIE] transient error code={api_code} attempt={attempt + 1}/"
-                    f"{KIE_MAX_RETRIES + 1} retry_in={delay:.1f}s msg={api_msg}"
+                    f"[KIE] transient error code={api_code} url={chat_url} "
+                    f"attempt={attempt + 1}/{KIE_MAX_RETRIES + 1} "
+                    f"retry_in={delay:.1f}s msg={api_msg}"
                 )
                 await asyncio.sleep(delay)
                 continue
@@ -343,6 +370,32 @@ async def kie_chat_completion(upstream_payload: Dict[str, Any]) -> Dict[str, Any
         )
 
     return last_payload
+
+
+async def kie_chat_completion(upstream_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Call Kie AI chat completions, falling back to alternate endpoints when needed."""
+    urls = get_kie_chat_urls()
+    if not urls:
+        raise HTTPException(status_code=503, detail="OpenAI API error: no Kie endpoints configured")
+
+    last_exc: Optional[HTTPException] = None
+    for url_index, chat_url in enumerate(urls):
+        try:
+            result = await kie_chat_completion_to_url(chat_url, upstream_payload)
+            if url_index > 0:
+                print(f"[KIE] succeeded via fallback url: {chat_url}")
+            return result
+        except HTTPException as exc:
+            last_exc = exc
+            detail = str(exc.detail)
+            if url_index < len(urls) - 1 and is_kie_fallback_worthy_error(detail):
+                print(f"[KIE] url failed ({detail[:120]}), trying fallback: {urls[url_index + 1]}")
+                continue
+            raise
+
+    if last_exc:
+        raise last_exc
+    raise HTTPException(status_code=502, detail="OpenAI API error: Kie request failed")
 
 
 def normalize_chat_completion_response(
