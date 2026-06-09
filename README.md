@@ -24,6 +24,11 @@ Python FastAPI backend that proxies chat requests to Kie AI (Gemini 3 Flash) wit
   - Official [Google Cloud Translation API](https://cloud.google.com/translate/docs) (not the free web widget)
   - API key stored only on the server (`GOOGLE_TRANSLATE_API_KEY`)
 
+- **OAuth token refresh** (`POST /api/oauth/token`)
+  - Refreshes Gmail OAuth access tokens using `refresh_token` (server-side `client_secret`)
+  - Replaces legacy `extensions-auth.uc.r.appspot.com/oauthToken`
+  - Response format matches the extension: plain text `eStr(JSON)` body
+
 ## Setup
 
 ### 1. Install Python Dependencies
@@ -54,12 +59,25 @@ Edit `.env`:
 ```
 KIE_API_KEY=your-kie-api-key
 GOOGLE_TRANSLATE_API_KEY=your-google-cloud-translation-api-key
+GOOGLE_OAUTH_CLIENT_ID=836033547101-qu9bbm4rjpefpivmslc3shdc5i1ohu9c.apps.googleusercontent.com
+GOOGLE_OAUTH_CLIENT_SECRET=your-google-oauth-client-secret
+GMAIL_APP_ITEM_ID=mailapp-1716052394833
 SECRET_KEY=generate-a-random-32-character-string
 ADMIN_KEY=another-random-string-for-admin-access
 ALLOWED_EXTENSION_ID=your-chrome-extension-id
 PORT=8005
 KIE_STREAM=false
 ```
+
+### Google OAuth token refresh (for `/api/oauth/token`)
+
+1. In [Google Cloud Console](https://console.cloud.google.com/), open the same OAuth client used by the extension (`manifest.json` → `oauth2.client_id`).
+2. Create or copy the **client secret** for the Web application client (used by `netvolk.online/google_app/oauth2callback` during grant).
+3. Set `GOOGLE_OAUTH_CLIENT_SECRET` in `.env` on the proxy server.
+4. `GOOGLE_OAUTH_CLIENT_ID` defaults to the current extension client ID; override only if needed.
+5. After deploy, `GET /api/health` should show `"oauth_configured": true`.
+
+The extension sends `refresh_token` obfuscated as `ert` (char-code +1). The proxy exchanges it with Google and returns a new `access_token`. **Never** put the client secret in extension source code.
 
 ### Google Cloud Translation API (for `/api/translate`)
 

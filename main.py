@@ -4,7 +4,7 @@ Proxies chat requests to Kie AI (Gemini 3 Flash, OpenAI-compatible API)
 """
 from fastapi import FastAPI, HTTPException, Header, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, validator
 from typing import List, Dict, Any, Optional, Union
 import os
@@ -32,8 +32,11 @@ KIE_CHAT_URL = os.getenv(
     "https://api.kie.ai/gemini-3-flash/v1/chat/completions",
 )
 KIE_STREAM = os.getenv("KIE_STREAM", "false").lower() in ("1", "true", "yes")
-KIE_MAX_RETRIES = int(os.getenv("KIE_MAX_RETRIES", "6"))
+KIE_MAX_RETRIES = int(os.getenv("KIE_MAX_RETRIES", "4"))
 KIE_RETRY_BASE_DELAY = float(os.getenv("KIE_RETRY_BASE_DELAY", "2.0"))
+KIE_REQUEST_TIMEOUT = float(os.getenv("KIE_REQUEST_TIMEOUT", "45"))
+# Stay under nginx default 60s proxy_read_timeout to avoid 504 Gateway Timeout
+KIE_MAX_RETRY_SECONDS = float(os.getenv("KIE_MAX_RETRY_SECONDS", "50"))
 # Kie AI transient errors (455 = maintenance, 429 = rate limit)
 KIE_RETRYABLE_HTTP_STATUSES = {429, 455, 500, 502, 503}
 KIE_RETRYABLE_API_CODES = {429, 455, 500, 501, 503, 505}
@@ -54,6 +57,20 @@ SUBSCRIPTION_EMAILS_FILE = os.getenv(
     "GMAIL_APP_SUBSCRIPTIONS_FILE",
     ".gmail_app_subscriptions.json"
 )
+
+# Google OAuth — refresh access tokens server-side (client_secret never in extension)
+GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_OAUTH_CLIENT_ID = os.getenv(
+    "GOOGLE_OAUTH_CLIENT_ID",
+    "836033547101-qu9bbm4rjpefpivmslc3shdc5i1ohu9c.apps.googleusercontent.com",
+)
+GOOGLE_OAUTH_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
+GOOGLE_OAUTH_CLIENT_ID_LEGACY = os.getenv(
+    "GOOGLE_OAUTH_CLIENT_ID_LEGACY",
+    "796046081733-jraj2so962ub425fi23escegerq2kn80.apps.googleusercontent.com",
+)
+GOOGLE_OAUTH_CLIENT_SECRET_LEGACY = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET_LEGACY")
+GMAIL_APP_ITEM_ID = os.getenv("GMAIL_APP_ITEM_ID", "mailapp-1716052394833")
 
 # CORS: any chrome-extension:// origin (unpacked vs store ID differs).
 # Chat auth: X-Extension-Id must match ALLOWED_EXTENSION_ID.
@@ -265,8 +282,10 @@ async def kie_chat_completion(upstream_payload: Dict[str, Any]) -> Dict[str, Any
     last_http_status = 502
     last_payload: Dict[str, Any] = {}
     last_text = ""
+    started_at = time.monotonic()
+    kie_timeout = httpx.Timeout(KIE_REQUEST_TIMEOUT)
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=kie_timeout) as client:
         for attempt in range(KIE_MAX_RETRIES + 1):
             kie_response = await client.post(
                 KIE_CHAT_URL,
@@ -295,6 +314,13 @@ async def kie_chat_completion(upstream_payload: Dict[str, Any]) -> Dict[str, Any
                 api_code = last_payload.get("code", kie_response.status_code)
                 api_msg = last_payload.get("msg", last_text[:200])
                 delay = KIE_RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1.5)
+                elapsed = time.monotonic() - started_at
+                if elapsed + delay > KIE_MAX_RETRY_SECONDS:
+                    print(
+                        f"[KIE] retry budget exhausted after {elapsed:.1f}s "
+                        f"(code={api_code} msg={api_msg})"
+                    )
+                    break
                 print(
                     f"[KIE] transient error code={api_code} attempt={attempt + 1}/"
                     f"{KIE_MAX_RETRIES + 1} retry_in={delay:.1f}s msg={api_msg}"
@@ -531,6 +557,97 @@ async def verify_signed_proxy_request(
         raise HTTPException(status_code=401, detail="Invalid request signature")
 
 
+def estr(raw: str, offset: int = 1) -> str:
+    """Match extension eStr(): shift each char code by offset."""
+    return "".join(chr(ord(char) + offset) for char in raw)
+
+
+def dstr(raw: str, offset: int = -1) -> str:
+    """Match extension dStr(): reverse eStr encoding."""
+    return estr(raw, offset)
+
+
+def encode_oauth_response(payload: Dict[str, Any]) -> str:
+    """Extension expects plain text body: dStr(JSON.stringify(payload))."""
+    return estr(json.dumps(payload, separators=(",", ":")))
+
+
+def resolve_oauth_client_credentials(use_legacy_client: bool) -> tuple[str, str]:
+    if use_legacy_client:
+        client_id = GOOGLE_OAUTH_CLIENT_ID_LEGACY
+        client_secret = GOOGLE_OAUTH_CLIENT_SECRET_LEGACY or GOOGLE_OAUTH_CLIENT_SECRET
+    else:
+        client_id = GOOGLE_OAUTH_CLIENT_ID
+        client_secret = GOOGLE_OAUTH_CLIENT_SECRET
+
+    if not client_id or not client_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="Google OAuth client credentials are not configured on the proxy server",
+        )
+
+    return client_id, client_secret
+
+
+def decode_refresh_token_from_body(body: Dict[str, Any]) -> str:
+    refresh_token = body.get("refresh_token")
+    if isinstance(refresh_token, str) and refresh_token.strip():
+        return refresh_token.strip()
+
+    encoded_token = body.get("ert")
+    if isinstance(encoded_token, str) and encoded_token:
+        try:
+            decoded = dstr(encoded_token)
+        except (ValueError, OverflowError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid ert encoding") from exc
+        if decoded.strip():
+            return decoded.strip()
+
+    raise HTTPException(status_code=400, detail="refresh_token or ert is required")
+
+
+async def google_refresh_access_token(refresh_token: str, use_legacy_client: bool) -> Dict[str, Any]:
+    client_id, client_secret = resolve_oauth_client_credentials(use_legacy_client)
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            GOOGLE_OAUTH_TOKEN_URL,
+            data={
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+    try:
+        payload = response.json()
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Google OAuth token endpoint returned invalid JSON ({response.status_code})",
+        ) from None
+
+    if response.status_code != 200:
+        # Return OAuth error in-body (HTTP 200) so the extension can prompt re-grant.
+        return {
+            "error": payload.get("error", "token_refresh_failed"),
+            "error_description": payload.get(
+                "error_description",
+                f"Google OAuth token endpoint returned {response.status_code}",
+            ),
+        }
+
+    if not payload.get("access_token"):
+        return {
+            "error": "invalid_response",
+            "error_description": "Google OAuth token endpoint did not return access_token",
+        }
+
+    return payload
+
+
 def load_gmail_app_subscription_emails() -> List[str]:
     """Load gmail_app subscription emails from a local hidden file."""
     if not os.path.exists(SUBSCRIPTION_EMAILS_FILE):
@@ -581,6 +698,7 @@ async def health_check():
             "status": "healthy",
             "openai_configured": bool(KIE_API_KEY),
             "translate_configured": bool(GOOGLE_TRANSLATE_API_KEY),
+            "oauth_configured": bool(GOOGLE_OAUTH_CLIENT_SECRET),
             "secret_configured": bool(SECRET_KEY),
             "timestamp": int(time.time()),
         },
@@ -706,6 +824,43 @@ async def get_gmail_app_subscription_emails(
     except Exception as e:
         print(f"Error processing subscription-emails request: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.post("/api/oauth/token")
+@app.post("/oauthToken")
+async def oauth_token(request: Request):
+    """
+    Refresh Google OAuth access tokens for the Chrome extension.
+
+    Contract matches legacy extensions-auth.uc.r.appspot.com/oauthToken:
+    - Request JSON: { version, ert, extension, old_client_id? }
+    - Response: plain text body = eStr(JSON.stringify(google_token_response))
+    """
+    try:
+        raw_body = await request.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+
+    if not isinstance(raw_body, dict):
+        raise HTTPException(status_code=400, detail="JSON body must be an object")
+
+    version = raw_body.get("version")
+    if version is None:
+        raise HTTPException(status_code=400, detail="version is required")
+
+    extension_item_id = raw_body.get("extension")
+    if GMAIL_APP_ITEM_ID and extension_item_id and extension_item_id != GMAIL_APP_ITEM_ID:
+        raise HTTPException(status_code=403, detail="Invalid extension identifier")
+
+    refresh_token = decode_refresh_token_from_body(raw_body)
+    use_legacy_client = bool(raw_body.get("old_client_id"))
+
+    payload = await google_refresh_access_token(refresh_token, use_legacy_client)
+    return PlainTextResponse(
+        content=encode_oauth_response(payload),
+        media_type="text/plain; charset=utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.post("/api/translate")
