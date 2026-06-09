@@ -12,6 +12,8 @@ import hashlib
 import hmac
 import time
 import json
+import asyncio
+import random
 from datetime import datetime
 from dotenv import load_dotenv
 import httpx
@@ -30,6 +32,11 @@ KIE_CHAT_URL = os.getenv(
     "https://api.kie.ai/gemini-3-flash/v1/chat/completions",
 )
 KIE_STREAM = os.getenv("KIE_STREAM", "false").lower() in ("1", "true", "yes")
+KIE_MAX_RETRIES = int(os.getenv("KIE_MAX_RETRIES", "4"))
+KIE_RETRY_BASE_DELAY = float(os.getenv("KIE_RETRY_BASE_DELAY", "2.0"))
+# Kie AI transient errors (455 = maintenance, 429 = rate limit)
+KIE_RETRYABLE_HTTP_STATUSES = {429, 455, 500, 502, 503}
+KIE_RETRYABLE_API_CODES = {429, 455, 500, 501, 503, 505}
 SECRET_KEY = os.getenv("SECRET_KEY")  # Shared secret with extension
 ALLOWED_EXTENSION_ID = os.getenv("ALLOWED_EXTENSION_ID")
 MAX_REQUEST_AGE = 300  # 5 minutes - requests older than this are rejected
@@ -229,6 +236,77 @@ def extract_message_content(content: Union[str, List[Any], Dict[str, Any], None]
     if isinstance(content, dict) and "text" in content:
         return str(content["text"])
     return str(content)
+
+
+def is_kie_retryable_response(http_status: int, payload: Optional[Dict[str, Any]]) -> bool:
+    """Return True when Kie AI returned a transient error worth retrying."""
+    if http_status in KIE_RETRYABLE_HTTP_STATUSES:
+        return True
+    if not isinstance(payload, dict):
+        return False
+    api_code = payload.get("code")
+    if isinstance(api_code, int) and api_code in KIE_RETRYABLE_API_CODES:
+        return "choices" not in payload
+    return False
+
+
+async def kie_chat_completion(upstream_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Call Kie AI chat completions with retries for transient upstream failures."""
+    last_http_status = 502
+    last_payload: Dict[str, Any] = {}
+    last_text = ""
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        for attempt in range(KIE_MAX_RETRIES + 1):
+            kie_response = await client.post(
+                KIE_CHAT_URL,
+                json=upstream_payload,
+                headers={
+                    "Authorization": f"Bearer {KIE_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+            )
+            last_http_status = kie_response.status_code
+            last_text = kie_response.text
+
+            try:
+                last_payload = kie_response.json()
+            except json.JSONDecodeError:
+                last_payload = {}
+
+            if kie_response.status_code == 200 and not is_kie_retryable_response(
+                kie_response.status_code, last_payload
+            ):
+                return last_payload
+
+            if attempt < KIE_MAX_RETRIES and is_kie_retryable_response(
+                kie_response.status_code, last_payload
+            ):
+                api_code = last_payload.get("code", kie_response.status_code)
+                api_msg = last_payload.get("msg", last_text[:200])
+                delay = KIE_RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1)
+                print(
+                    f"[KIE] transient error code={api_code} attempt={attempt + 1}/"
+                    f"{KIE_MAX_RETRIES + 1} retry_in={delay:.1f}s msg={api_msg}"
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            break
+
+    if last_http_status != 200:
+        raise HTTPException(
+            status_code=last_http_status if last_http_status >= 400 else 502,
+            detail=f"OpenAI API error: {last_text}",
+        )
+
+    if last_payload.get("code") and last_payload.get("msg") and "choices" not in last_payload:
+        raise HTTPException(
+            status_code=502,
+            detail=f"OpenAI API error: {last_payload.get('msg', last_payload)}",
+        )
+
+    return last_payload
 
 
 def normalize_chat_completion_response(
@@ -550,36 +628,20 @@ async def chat_completion(
         if raw_body.get("max_tokens"):
             upstream_payload["max_tokens"] = raw_body["max_tokens"]
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            kie_response = await client.post(
-                KIE_CHAT_URL,
-                json=upstream_payload,
-                headers={
-                    "Authorization": f"Bearer {KIE_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-            )
+        try:
+            result = await kie_chat_completion(upstream_payload)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"OpenAI API error: invalid JSON response ({exc})",
+            ) from exc
 
-            if kie_response.status_code != 200:
-                raise HTTPException(
-                    status_code=kie_response.status_code,
-                    detail=f"OpenAI API error: {kie_response.text}",
-                )
+        result = normalize_chat_completion_response(result, requested_model)
 
-            try:
-                result = kie_response.json()
-            except json.JSONDecodeError as exc:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"OpenAI API error: invalid JSON response ({exc})",
-                ) from exc
+        tokens_used = result.get("usage", {}).get("total_tokens", 0)
+        track_usage(headers["fingerprint"], requested_model, tokens_used)
 
-            result = normalize_chat_completion_response(result, requested_model)
-
-            tokens_used = result.get("usage", {}).get("total_tokens", 0)
-            track_usage(headers["fingerprint"], requested_model, tokens_used)
-
-            return result
+        return result
 
     except HTTPException:
         raise
