@@ -32,11 +32,12 @@ KIE_CHAT_URL = os.getenv(
     "https://api.kie.ai/gemini-3-flash/v1/chat/completions",
 )
 KIE_STREAM = os.getenv("KIE_STREAM", "false").lower() in ("1", "true", "yes")
-KIE_MAX_RETRIES = int(os.getenv("KIE_MAX_RETRIES", "4"))
+KIE_MAX_RETRIES = int(os.getenv("KIE_MAX_RETRIES", "6"))
 KIE_RETRY_BASE_DELAY = float(os.getenv("KIE_RETRY_BASE_DELAY", "2.0"))
 # Kie AI transient errors (455 = maintenance, 429 = rate limit)
 KIE_RETRYABLE_HTTP_STATUSES = {429, 455, 500, 502, 503}
 KIE_RETRYABLE_API_CODES = {429, 455, 500, 501, 503, 505}
+KIE_MAINTENANCE_PHRASE = "being maintained"
 SECRET_KEY = os.getenv("SECRET_KEY")  # Shared secret with extension
 ALLOWED_EXTENSION_ID = os.getenv("ALLOWED_EXTENSION_ID")
 MAX_REQUEST_AGE = 300  # 5 minutes - requests older than this are rejected
@@ -238,14 +239,23 @@ def extract_message_content(content: Union[str, List[Any], Dict[str, Any], None]
     return str(content)
 
 
-def is_kie_retryable_response(http_status: int, payload: Optional[Dict[str, Any]]) -> bool:
+def is_kie_retryable_response(
+    http_status: int,
+    payload: Optional[Dict[str, Any]],
+    response_text: str = "",
+) -> bool:
     """Return True when Kie AI returned a transient error worth retrying."""
     if http_status in KIE_RETRYABLE_HTTP_STATUSES:
+        return True
+    if KIE_MAINTENANCE_PHRASE in (response_text or "").lower():
         return True
     if not isinstance(payload, dict):
         return False
     api_code = payload.get("code")
     if isinstance(api_code, int) and api_code in KIE_RETRYABLE_API_CODES:
+        return "choices" not in payload
+    api_msg = str(payload.get("msg", ""))
+    if KIE_MAINTENANCE_PHRASE in api_msg.lower():
         return "choices" not in payload
     return False
 
@@ -275,16 +285,16 @@ async def kie_chat_completion(upstream_payload: Dict[str, Any]) -> Dict[str, Any
                 last_payload = {}
 
             if kie_response.status_code == 200 and not is_kie_retryable_response(
-                kie_response.status_code, last_payload
+                kie_response.status_code, last_payload, last_text
             ):
                 return last_payload
 
             if attempt < KIE_MAX_RETRIES and is_kie_retryable_response(
-                kie_response.status_code, last_payload
+                kie_response.status_code, last_payload, last_text
             ):
                 api_code = last_payload.get("code", kie_response.status_code)
                 api_msg = last_payload.get("msg", last_text[:200])
-                delay = KIE_RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1)
+                delay = KIE_RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1.5)
                 print(
                     f"[KIE] transient error code={api_code} attempt={attempt + 1}/"
                     f"{KIE_MAX_RETRIES + 1} retry_in={delay:.1f}s msg={api_msg}"
