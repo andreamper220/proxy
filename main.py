@@ -58,6 +58,7 @@ SUBSCRIPTION_EMAILS_FILE = os.getenv(
     "GMAIL_APP_SUBSCRIPTIONS_FILE",
     ".gmail_app_subscriptions.json"
 )
+PAYWALL_BASE_URL = os.getenv("PAYWALL_BASE_URL", "https://payment.netvolk.online").rstrip("/")
 
 # Google OAuth — refresh access tokens server-side (client_secret never in extension)
 GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -877,6 +878,50 @@ async def get_gmail_app_subscription_emails(
     except Exception as e:
         print(f"Error processing subscription-emails request: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.post("/api/gmail_app/paywall-funnel")
+async def paywall_funnel_proxy(request: Request):
+    """
+    Forward extension funnel analytics to paywall server.
+    Extension → proxy.netvolk.online → payment.netvolk.online/api/analytics/funnel
+    """
+    body = await request.body()
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{PAYWALL_BASE_URL}/api/analytics/funnel",
+                content=body,
+                headers={
+                    "Content-Type": request.headers.get("content-type", "application/json"),
+                },
+            )
+        if resp.headers.get("content-type", "").startswith("application/json"):
+            return JSONResponse(content=resp.json(), status_code=resp.status_code)
+        return JSONResponse(content={"ok": resp.is_success}, status_code=resp.status_code)
+    except httpx.RequestError as e:
+        print(f"paywall-funnel proxy error: {e}")
+        raise HTTPException(status_code=502, detail="Paywall upstream unavailable")
+
+
+@app.get("/api/gmail_app/paywall-check-access")
+async def paywall_check_access_proxy(request: Request):
+    """
+    Forward subscription + geo check to paywall public API.
+    Extension → proxy → payment.netvolk.online/api/user/check
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                f"{PAYWALL_BASE_URL}/api/user/check",
+                params=dict(request.query_params),
+            )
+        if resp.headers.get("content-type", "").startswith("application/json"):
+            return JSONResponse(content=resp.json(), status_code=resp.status_code)
+        raise HTTPException(status_code=502, detail="Invalid paywall response")
+    except httpx.RequestError as e:
+        print(f"paywall-check-access proxy error: {e}")
+        raise HTTPException(status_code=502, detail="Paywall upstream unavailable")
 
 
 @app.post("/api/oauth/token")
